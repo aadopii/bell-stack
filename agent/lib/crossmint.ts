@@ -1,3 +1,4 @@
+import type { ApprovalResponseContext, ApprovalResponseDecision } from "eve/tools/approval";
 import { z } from "zod";
 import {
   AMOUNT,
@@ -24,6 +25,14 @@ export type CheckoutToolOutput =
 export function notConfigured(): CheckoutToolOutput | undefined {
   if (isCrossmintConfigured()) return undefined;
   return { status: "not_configured", hint: "Set CROSSMINT_SERVER_API_KEY and CROSSMINT_USER_ID on the server. See docs/crossmint.md." };
+}
+
+/** Approval response policy for payments: only the authenticated sender who asked can approve. */
+export function requesterOnly({ request, response }: Pick<ApprovalResponseContext<unknown>, "request" | "response">): ApprovalResponseDecision {
+  const requester = request.principal;
+  if (!requester) return { status: "rejected", reason: "Payments need an authenticated sender." };
+  const same = response.principal.principalId === requester.principalId && response.principal.authenticator === requester.authenticator;
+  return same ? { status: "allowed" } : { status: "rejected", reason: "Only the person who requested this payment can approve it." };
 }
 
 /** Crossmint errors carry fixed, sanitized messages the model may see. Anything else is rethrown. */

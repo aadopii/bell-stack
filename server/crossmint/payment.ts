@@ -27,7 +27,7 @@ export class PaymentMismatchError extends Error {
   }
 }
 
-function hostOf(value: string): string | undefined {
+export function hostOf(value: string): string | undefined {
   return URL.parse(value.includes("://") ? value : `https://${value}`)?.hostname.toLowerCase();
 }
 

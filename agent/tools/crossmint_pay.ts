@@ -1,7 +1,7 @@
 import { defineTool, toolOutput } from "eve/tools";
 import { always } from "eve/tools/approval";
 import { z } from "zod";
-import { amount, currency, errorOutput, notConfigured, requestId, runId, WAIT_MS, type CheckoutToolOutput } from "../lib/crossmint";
+import { amount, currency, errorOutput, notConfigured, requestId, requesterOnly, runId, WAIT_MS, type CheckoutToolOutput } from "../lib/crossmint";
 import { CrossmintSetupError, getCheckout, payWithOrderIntent, waitForCheckout } from "../../server/crossmint/client";
 import { assertPaymentMatches, PaymentMismatchError } from "../../server/crossmint/payment";
 import { assertSessionCheckout } from "../../server/crossmint/runs";
@@ -28,12 +28,7 @@ export default defineTool({
   approval: {
     request: always(),
     prompt: ({ input }) => `Pay ${input.amount} ${input.currency} to ${input.merchant} with your Crossmint order intent?`,
-    response: ({ request, response }) => {
-      const requester = request.principal;
-      if (!requester) return { status: "rejected", reason: "Payments need an authenticated sender." };
-      const same = response.principal.principalId === requester.principalId && response.principal.authenticator === requester.authenticator;
-      return same ? { status: "allowed" } : { status: "rejected", reason: "Only the person who requested this payment can approve it." };
-    },
+    response: requesterOnly,
   },
   async execute(input, ctx): Promise<PayOutput> {
     ctx.abortSignal.throwIfAborted();
