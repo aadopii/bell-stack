@@ -253,6 +253,13 @@ pnpm crossmint:operator-jwt
 The command prints a token valid for ten minutes. Treat it like a password until it expires. The
 reference app's origin must also be an allowed origin of the client key.
 
+Bell also serves the setup at `/crossmint/cards`, for the operator only: it asks for
+`BELL_OPERATOR_USERNAME` and `BELL_OPERATOR_PASSWORD`, also when Bell runs locally. The page renders
+Crossmint's `CrossmintAgentCardAuthorization` component, which selects or saves the card, registers
+it, creates the order intent, and runs the rail verification, then shows the line to paste into
+`.env.local`. The page pulls in Crossmint's React SDK, which carries wallet and chain dependencies
+the card page does not use.
+
 1. Save the card.
 2. Register it for agent payments. Registration finds the card's network rail and grants nothing.
 3. Create an order intent with an amount, an expiry, and the merchant's name, HTTPS URL, and

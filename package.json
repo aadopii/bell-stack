@@ -26,6 +26,7 @@
     "@ai-sdk/openai": "4.0.46",
     "@browserbasehq/sdk": "2.18.0",
     "@browserbasehq/stagehand": "4.3.0",
+    "@crossmint/client-sdk-react-ui": "4.12.1",
     "@stripe/link-integrations-eve": "0.3.4",
     "ai": "7.0.137",
     "eve": "0.79.1",
