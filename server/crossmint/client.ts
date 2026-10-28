@@ -3,9 +3,9 @@ import { randomUUID } from "node:crypto";
 /**
  * Crossmint Agent Checkouts, server side.
  *
- * Crossmint runs the merchant checkout in its own service and exposes it as a run with status
- * snapshots. Bell holds the API key, the buyer id, the optional buyer profile, and the order
- * intent on the server. The model sees a projection of each snapshot and nothing else.
+ * Crossmint runs the checkout at any store and exposes it as a run with status snapshots. Bell
+ * holds the API key, the buyer id, the optional buyer profile, and the order intent on the server.
+ * The model sees a projection of each snapshot and nothing else.
  * API reference: https://docs.crossmint.com/api-reference/agent-checkouts
  */
 
@@ -19,32 +19,23 @@ export class CrossmintSetupError extends Error {
   }
 }
 
-export type CrossmintRequestReason =
-  | "unauthorized"
-  | "not_found"
-  | "rate_limited"
-  | "transport"
-  | "invalid_response"
-  | "http_error";
+/** Fixed messages. Provider bodies can echo the request, the key prefix, or merchant data. */
+const REQUEST_MESSAGES = {
+  unauthorized: "Crossmint rejected the API key or its scopes.",
+  not_found: "Crossmint has no checkout with that id for this buyer.",
+  rate_limited: "Crossmint rate limited the request. Retry shortly.",
+  transport: "Crossmint request failed. Check connectivity and retry.",
+  invalid_response: "Crossmint returned an unexpected response.",
+};
+
+export type CrossmintRequestReason = keyof typeof REQUEST_MESSAGES | "http_error";
 
 export class CrossmintRequestError extends Error {
   constructor(
     readonly reason: CrossmintRequestReason,
     readonly status?: number,
   ) {
-    super(
-      reason === "unauthorized"
-        ? "Crossmint rejected the API key or its scopes."
-        : reason === "not_found"
-          ? "Crossmint has no checkout with that id for this buyer."
-          : reason === "rate_limited"
-            ? "Crossmint rate limited the request. Retry shortly."
-            : reason === "transport"
-              ? "Crossmint request failed. Check connectivity and retry."
-              : reason === "invalid_response"
-                ? "Crossmint returned an unexpected response."
-                : `Crossmint returned HTTP ${status}.`,
-    );
+    super(reason === "http_error" ? `Crossmint returned HTTP ${status}.` : REQUEST_MESSAGES[reason]);
     this.name = "CrossmintRequestError";
   }
 }
@@ -81,64 +72,44 @@ export interface CrossmintConfig {
 
 export const DEFAULT_BASE_URL = "https://www.crossmint.com/api/unstable";
 
-const DECIMAL = /^\d+(\.\d{1,2})?$/;
-const CURRENCY = /^[A-Z]{3}$/;
+/** Crossmint's amount pattern, capped at two decimals. No zero, no leading zeros. */
+export const AMOUNT = /^(?:[1-9]\d{0,14}(?:\.\d{1,2})?|0\.(?=\d*[1-9])\d{1,2})$/;
+export const CURRENCY = /^[A-Z]{3}$/;
 
-export function isCrossmintConfigured(
-  env: Record<string, string | undefined> = process.env,
-): boolean {
+export function isCrossmintConfigured(env: Record<string, string | undefined> = process.env): boolean {
   return Boolean(env.CROSSMINT_SERVER_API_KEY?.trim() && env.CROSSMINT_USER_ID?.trim());
 }
 
-export function crossmintConfig(
-  env: Record<string, string | undefined> = process.env,
-): CrossmintConfig {
+export function crossmintConfig(env: Record<string, string | undefined> = process.env): CrossmintConfig {
   const required = (name: string) => {
     const value = env[name]?.trim();
     if (!value) throw new CrossmintSetupError("missing_configuration", name);
     return value;
   };
   const invalid = (name: string) => new CrossmintSetupError("invalid_configuration", name);
+  const httpsUrl = (value: string, name: string) => {
+    const url = URL.parse(value);
+    if (!url || url.protocol !== "https:" || url.username || url.password) throw invalid(name);
+    return url;
+  };
 
   const apiKey = required("CROSSMINT_SERVER_API_KEY");
   if (!apiKey.startsWith("sk_")) throw invalid("CROSSMINT_SERVER_API_KEY");
   const userId = required("CROSSMINT_USER_ID");
-
-  const baseUrl = env.CROSSMINT_API_BASE_URL?.trim() || DEFAULT_BASE_URL;
-  let base: URL;
-  try {
-    base = new URL(baseUrl);
-  } catch {
-    throw invalid("CROSSMINT_API_BASE_URL");
-  }
-  if (base.protocol !== "https:" || base.username || base.password || base.search || base.hash) {
-    throw invalid("CROSSMINT_API_BASE_URL");
-  }
+  const base = httpsUrl(env.CROSSMINT_API_BASE_URL?.trim() || DEFAULT_BASE_URL, "CROSSMINT_API_BASE_URL");
+  if (base.search || base.hash) throw invalid("CROSSMINT_API_BASE_URL");
 
   let maxCost: MaxCost | undefined;
   const cap = env.CROSSMINT_MAX_COST?.trim();
   if (cap) {
-    const [amount, currency] = cap.split(/\s+/);
-    if (!amount || !currency || !DECIMAL.test(amount) || !CURRENCY.test(currency)) {
-      throw invalid("CROSSMINT_MAX_COST");
-    }
+    const [amount = "", currency = ""] = cap.split(/\s+/);
+    if (!AMOUNT.test(amount) || !CURRENCY.test(currency)) throw invalid("CROSSMINT_MAX_COST");
     maxCost = { amount, currency };
   }
 
-  const allowedMerchants =
-    env.CROSSMINT_ALLOWED_MERCHANTS?.split(",")
-      .map((value) => value.trim())
-      .filter(Boolean) ?? [];
+  const allowedMerchants = env.CROSSMINT_ALLOWED_MERCHANTS?.split(",").map((value) => value.trim()).filter(Boolean) ?? [];
   for (const origin of allowedMerchants) {
-    let url: URL;
-    try {
-      url = new URL(origin);
-    } catch {
-      throw invalid("CROSSMINT_ALLOWED_MERCHANTS");
-    }
-    if (url.protocol !== "https:" || url.origin !== origin || url.username || url.password) {
-      throw invalid("CROSSMINT_ALLOWED_MERCHANTS");
-    }
+    if (httpsUrl(origin, "CROSSMINT_ALLOWED_MERCHANTS").origin !== origin) throw invalid("CROSSMINT_ALLOWED_MERCHANTS");
   }
 
   return {
@@ -152,11 +123,11 @@ export function crossmintConfig(
   };
 }
 
-/** Compare two decimal strings without floating point. Returns -1, 0, or 1. */
+/** Compare two decimal strings at Crossmint's six-decimal precision. Returns -1, 0, or 1. */
 export function compareAmounts(a: string, b: string): number {
   const scale = (value: string) => {
     const [whole, fraction = ""] = value.split(".");
-    return BigInt(whole + fraction.padEnd(2, "0").slice(0, 2));
+    return BigInt(whole + fraction.padEnd(6, "0").slice(0, 6));
   };
   const left = scale(a);
   const right = scale(b);
@@ -164,42 +135,19 @@ export function compareAmounts(a: string, b: string): number {
 }
 
 /** Enforce the operator's merchant allowlist and spending ceiling before anything is created. */
-export function assertCheckoutPolicy(
-  startUrl: string,
-  maxCost: MaxCost,
-  config: CrossmintConfig,
-): void {
+export function assertCheckoutPolicy(startUrl: string, maxCost: MaxCost, config: CrossmintConfig): void {
   if (config.allowedMerchants.length) {
-    let url: URL;
-    try {
-      url = new URL(startUrl);
-    } catch {
-      throw new CrossmintPolicyError("merchant_not_allowed", "The start URL is not a valid HTTPS URL.");
-    }
-    if (
-      url.protocol !== "https:" ||
-      url.username ||
-      url.password ||
-      !config.allowedMerchants.includes(url.origin)
-    ) {
-      throw new CrossmintPolicyError(
-        "merchant_not_allowed",
-        "This merchant is not in CROSSMINT_ALLOWED_MERCHANTS.",
-      );
+    const url = URL.parse(startUrl);
+    if (!url || url.protocol !== "https:" || url.username || url.password || !config.allowedMerchants.includes(url.origin)) {
+      throw new CrossmintPolicyError("merchant_not_allowed", "This merchant is not in CROSSMINT_ALLOWED_MERCHANTS.");
     }
   }
   if (config.maxCost) {
     if (maxCost.currency !== config.maxCost.currency) {
-      throw new CrossmintPolicyError(
-        "currency_mismatch",
-        `Checkouts are limited to ${config.maxCost.currency} by CROSSMINT_MAX_COST.`,
-      );
+      throw new CrossmintPolicyError("currency_mismatch", `Checkouts are limited to ${config.maxCost.currency} by CROSSMINT_MAX_COST.`);
     }
     if (compareAmounts(maxCost.amount, config.maxCost.amount) > 0) {
-      throw new CrossmintPolicyError(
-        "cap_exceeded",
-        `The spending cap exceeds the operator ceiling of ${config.maxCost.amount} ${config.maxCost.currency}.`,
-      );
+      throw new CrossmintPolicyError("cap_exceeded", `The spending cap exceeds the operator ceiling of ${config.maxCost.amount} ${config.maxCost.currency}.`);
     }
   }
 }
@@ -212,21 +160,11 @@ export interface CreateCheckoutInput {
   countryCode?: string;
 }
 
-export type CheckoutStatus =
-  | "queued"
-  | "running"
-  | "awaiting_input"
-  | "succeeded"
-  | "failed"
-  | "cancelled"
-  | "blocked";
+export type CheckoutStatus = "queued" | "running" | "awaiting_input" | "succeeded" | "failed" | "cancelled" | "blocked";
 
-export const TERMINAL_STATUSES: ReadonlySet<CheckoutStatus> = new Set([
-  "succeeded",
-  "failed",
-  "cancelled",
-  "blocked",
-]);
+const STATUSES: ReadonlySet<string> = new Set<CheckoutStatus>(["queued", "running", "awaiting_input", "succeeded", "failed", "cancelled", "blocked"]);
+
+export const TERMINAL_STATUSES: ReadonlySet<CheckoutStatus> = new Set<CheckoutStatus>(["succeeded", "failed", "cancelled", "blocked"]);
 
 /** Model-safe view of a form field. `protected` fields cannot be answered through the model. */
 export interface CheckoutFormField {
@@ -234,8 +172,11 @@ export interface CheckoutFormField {
   label: string;
   required: boolean;
   handling: "standard" | "protected";
-  type: string;
-  choices?: string[];
+  /** Crossmint's input kind: text, multiline, boolean, choice, integer, or number. */
+  kind: string;
+  /** For a choice field, the values the model may answer with. Placeholder and disabled options are left out. */
+  options?: { value: string; label: string }[];
+  selection?: "one" | "many";
 }
 
 export interface CheckoutAmount {
@@ -272,10 +213,7 @@ export interface CheckoutSnapshot {
     outcome?: string;
     summary?: string;
     code?: string;
-    purchase?: {
-      kind: string;
-      receipt?: { total?: MaxCost; merchantOrderId?: string };
-    };
+    purchase?: { kind: string; receipt?: { total?: MaxCost; merchantOrderId?: string } };
   } | null;
   failureReason: string | null;
 }
@@ -288,11 +226,7 @@ export interface CrossmintClientOptions {
 
 const REQUEST_TIMEOUT_MS = 20_000;
 
-async function request(
-  path: string,
-  init: { method: "GET" | "POST"; body?: unknown },
-  options: CrossmintClientOptions,
-): Promise<unknown> {
+async function request(path: string, init: { method: "GET" | "POST"; body?: unknown }, options: CrossmintClientOptions): Promise<unknown> {
   const config = options.config ?? crossmintConfig();
   const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
   const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout;
@@ -311,17 +245,16 @@ async function request(
       signal,
     });
   } catch {
-    signal.throwIfAborted();
+    options.signal?.throwIfAborted();
     throw new CrossmintRequestError("transport");
   }
   if (!response.ok) {
-    // Provider bodies can echo the request, the key prefix, or merchant data. Drop them.
-    if (response.status === 401 || response.status === 403) {
-      throw new CrossmintRequestError("unauthorized", response.status);
-    }
-    if (response.status === 404) throw new CrossmintRequestError("not_found", 404);
-    if (response.status === 429) throw new CrossmintRequestError("rate_limited", 429);
-    throw new CrossmintRequestError("http_error", response.status);
+    const reason: CrossmintRequestReason =
+      response.status === 401 || response.status === 403 ? "unauthorized"
+        : response.status === 404 ? "not_found"
+          : response.status === 429 ? "rate_limited"
+            : "http_error";
+    throw new CrossmintRequestError(reason, response.status);
   }
   const text = await response.text().catch(() => "");
   if (!text.trim()) return null;
@@ -332,247 +265,161 @@ async function request(
   }
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+type Json = Record<string, unknown>;
+
+const record = (value: unknown): Json => (typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Json) : {});
+const string = (value: unknown): string | undefined => (typeof value === "string" ? value : undefined);
+const present = <T extends Json>(value: T): Partial<T> =>
+  Object.fromEntries(Object.entries(value).filter(([, v]) => v !== undefined)) as Partial<T>;
+
+function projectField(raw: unknown): CheckoutFormField | undefined {
+  const field = record(raw);
+  const key = string(field.key);
+  if (!key) return undefined;
+  const input = record(field.input);
+  const selectionKind = string(record(input.selection).kind);
+  const selection = selectionKind === "one" || selectionKind === "many" ? selectionKind : undefined;
+  const options = Array.isArray(input.options)
+    ? input.options.flatMap((option) => {
+        const { value, label, placeholder, disabled } = record(option);
+        const v = string(value);
+        return v === undefined || placeholder === true || disabled === true ? [] : [{ value: v, label: string(label) ?? v }];
+      })
+    : undefined;
+  return {
+    key,
+    label: string(field.label) ?? key,
+    required: field.required === true,
+    handling: field.handling === "protected" ? "protected" : "standard",
+    kind: string(input.kind) ?? "text",
+    ...(options ? { options } : {}),
+    ...(selection ? { selection } : {}),
+  };
 }
 
-function asString(value: unknown): string | undefined {
-  return typeof value === "string" ? value : undefined;
-}
-
-function projectAmount(value: unknown): MaxCost | undefined {
-  if (!isRecord(value)) return undefined;
-  const amount = asString(value.amount);
-  const currency = asString(value.currency);
-  return amount && currency ? { amount, currency } : undefined;
-}
-
-function projectInteraction(value: unknown): CheckoutInteraction {
-  if (!isRecord(value)) return { kind: "unsupported" };
+function projectInteraction(raw: unknown): CheckoutInteraction {
+  const value = record(raw);
   if (value.kind === "form" && Array.isArray(value.fields)) {
-    const fields: CheckoutFormField[] = [];
-    for (const field of value.fields) {
-      if (!isRecord(field)) continue;
-      const key = asString(field.key);
-      if (!key) continue;
-      const input = isRecord(field.input) ? field.input : {};
-      const choices = Array.isArray(input.choices)
-        ? input.choices
-            .map((choice) => {
-              if (typeof choice === "string") return choice;
-              if (isRecord(choice)) return asString(choice.value) ?? asString(choice.label);
-              return undefined;
-            })
-            .filter((choice): choice is string => Boolean(choice))
-        : undefined;
-      fields.push({
-        key,
-        label: asString(field.label) ?? key,
-        required: field.required === true,
-        handling: field.handling === "protected" ? "protected" : "standard",
-        type: asString(input.type) ?? "text",
-        ...(choices?.length ? { choices } : {}),
-      });
-    }
-    return { kind: "form", fields };
+    return { kind: "form", fields: value.fields.flatMap((field) => projectField(field) ?? []) };
   }
   if (value.kind === "payment") {
-    const amount = isRecord(value.amount) ? value.amount : {};
-    const merchant = isRecord(value.merchant) ? value.merchant : {};
+    const amount = record(value.amount);
+    const merchant = record(value.merchant);
     return {
       kind: "payment",
-      method: asString(value.method) ?? "unknown",
-      amount: {
-        kind: amount.kind === "maximum" ? "maximum" : "exact",
-        value: asString(amount.value) ?? "",
-        currency: asString(amount.currency) ?? "",
-      },
-      merchant: {
-        ...(asString(merchant.name) ? { name: asString(merchant.name) } : {}),
-        ...(asString(merchant.url) ? { url: asString(merchant.url) } : {}),
-        ...(asString(merchant.countryCode) ? { countryCode: asString(merchant.countryCode) } : {}),
-      },
+      method: string(value.method) ?? "unknown",
+      amount: { kind: amount.kind === "maximum" ? "maximum" : "exact", value: string(amount.value) ?? "", currency: string(amount.currency) ?? "" },
+      merchant: present({ name: string(merchant.name), url: string(merchant.url), countryCode: string(merchant.countryCode) }),
     };
   }
   return { kind: "unsupported" };
 }
 
-const STATUSES: ReadonlySet<string> = new Set([
-  "queued",
-  "running",
-  "awaiting_input",
-  "succeeded",
-  "failed",
-  "cancelled",
-  "blocked",
-]);
-
 /** Project a raw snapshot to the fields the model may see. Anything unlisted is discarded. */
 export function projectCheckout(raw: unknown): CheckoutSnapshot {
-  if (!isRecord(raw)) throw new CrossmintRequestError("invalid_response");
-  const runId = asString(raw.runId);
-  const status = asString(raw.status);
-  if (!runId || !status || !STATUSES.has(status)) {
-    throw new CrossmintRequestError("invalid_response");
-  }
-  const revision = typeof raw.revision === "number" ? raw.revision : 0;
+  const run = record(raw);
+  const runId = string(run.runId);
+  const status = string(run.status);
+  if (!runId || !status || !STATUSES.has(status)) throw new CrossmintRequestError("invalid_response");
+
   let requiredAction: CheckoutRequiredAction | null = null;
-  if (status === "awaiting_input" && isRecord(raw.requiredAction)) {
-    const action = raw.requiredAction;
-    const requestId = asString(action.requestId);
-    const req = isRecord(action.request) ? action.request : {};
-    if (requestId) {
-      requiredAction = {
-        requestId,
-        question: asString(req.question) ?? "",
-        ...(asString(req.expiresAt) ? { expiresAt: asString(req.expiresAt) } : {}),
-        interaction: projectInteraction(req.interaction),
-      };
-    }
-  }
-  let result: CheckoutSnapshot["result"] = null;
-  if (isRecord(raw.result)) {
-    const purchase = isRecord(raw.result.purchase) ? raw.result.purchase : undefined;
-    const receipt = purchase && isRecord(purchase.receipt) ? purchase.receipt : undefined;
-    const kind = purchase ? asString(purchase.kind) : undefined;
-    result = {
-      ...(asString(raw.result.outcome) ? { outcome: asString(raw.result.outcome) } : {}),
-      ...(asString(raw.result.summary) ? { summary: asString(raw.result.summary) } : {}),
-      ...(asString(raw.result.code) ? { code: asString(raw.result.code) } : {}),
-      ...(kind
-        ? {
-            purchase: {
-              kind,
-              ...(receipt
-                ? {
-                    receipt: {
-                      ...(projectAmount(receipt.total) ? { total: projectAmount(receipt.total) } : {}),
-                      ...(asString(receipt.merchantOrderId)
-                        ? { merchantOrderId: asString(receipt.merchantOrderId) }
-                        : {}),
-                    },
-                  }
-                : {}),
-            },
-          }
-        : {}),
+  const action = record(run.requiredAction);
+  const requestId = string(action.requestId);
+  if (status === "awaiting_input" && requestId) {
+    const req = record(action.request);
+    requiredAction = {
+      requestId,
+      question: string(req.question) ?? "",
+      ...present({ expiresAt: string(req.expiresAt) }),
+      interaction: projectInteraction(req.interaction),
     };
   }
+
+  let result: CheckoutSnapshot["result"] = null;
+  if (run.result !== undefined && run.result !== null) {
+    const raw = record(run.result);
+    const purchase = record(raw.purchase);
+    const receipt = record(purchase.receipt);
+    const total = record(receipt.total);
+    const kind = string(purchase.kind);
+    result = present({
+      outcome: string(raw.outcome),
+      summary: string(raw.summary),
+      code: string(raw.code),
+      purchase: kind
+        ? {
+            kind,
+            ...(purchase.receipt !== undefined
+              ? {
+                  receipt: present({
+                    total: string(total.amount) && string(total.currency) ? { amount: total.amount as string, currency: total.currency as string } : undefined,
+                    merchantOrderId: string(receipt.merchantOrderId),
+                  }),
+                }
+              : {}),
+          }
+        : undefined,
+    });
+  }
+
   return {
     runId,
     status: status as CheckoutStatus,
-    revision,
+    revision: typeof run.revision === "number" ? run.revision : 0,
     requiredAction,
     result,
-    failureReason: status === "failed" ? (asString(raw.reason) ?? "unknown") : null,
+    failureReason: status === "failed" ? (string(run.reason) ?? "unknown") : null,
   };
 }
 
-export async function createCheckout(
-  input: CreateCheckoutInput,
-  options: CrossmintClientOptions = {},
-): Promise<{ runId: string }> {
+export async function createCheckout(input: CreateCheckoutInput, options: CrossmintClientOptions = {}): Promise<{ runId: string }> {
   const config = options.config ?? crossmintConfig();
   assertCheckoutPolicy(input.startUrl, input.maxCost, config);
   const body = {
     request: { startUrl: input.startUrl, task: input.task },
     constraints: { maxCost: input.maxCost },
-    ...(config.buyerProfileId ? { buyerProfileId: config.buyerProfileId } : {}),
-    ...(input.merchantGuidance ? { merchantGuidance: input.merchantGuidance } : {}),
-    ...(input.countryCode
-      ? { browser: { location: { type: "country", countryCode: input.countryCode } } }
-      : {}),
+    ...present({
+      buyerProfileId: config.buyerProfileId,
+      merchantGuidance: input.merchantGuidance,
+      browser: input.countryCode ? { location: { type: "country", countryCode: input.countryCode } } : undefined,
+    }),
   };
-  const raw = await request("/agent-checkouts", { method: "POST", body }, { ...options, config });
-  const runId = isRecord(raw) ? asString(raw.runId) : undefined;
+  const runId = string(record(await request("/agent-checkouts", { method: "POST", body }, { ...options, config })).runId);
   if (!runId) throw new CrossmintRequestError("invalid_response");
   return { runId };
 }
 
-export async function getCheckout(
-  runId: string,
-  options: CrossmintClientOptions = {},
-): Promise<CheckoutSnapshot> {
-  const raw = await request(
-    `/agent-checkouts/${encodeURIComponent(runId)}`,
-    { method: "GET" },
-    options,
-  );
-  return projectCheckout(raw);
+export async function getCheckout(runId: string, options: CrossmintClientOptions = {}): Promise<CheckoutSnapshot> {
+  return projectCheckout(await request(`/agent-checkouts/${encodeURIComponent(runId)}`, { method: "GET" }, options));
 }
 
 export type FormAnswer = string | number | boolean | string[];
 
-function message(parts: unknown[]) {
-  return { id: `bell_${randomUUID()}`, parts };
-}
-
-export async function answerForm(
-  runId: string,
-  requestId: string,
-  answers: Record<string, FormAnswer>,
-  options: CrossmintClientOptions = {},
-): Promise<void> {
+/** One `input_response` part per message, with a fresh message id. */
+async function respond(runId: string, part: Json, options: CrossmintClientOptions): Promise<void> {
   await request(
     `/agent-checkouts/${encodeURIComponent(runId)}/messages`,
-    {
-      method: "POST",
-      body: message([
-        {
-          type: "input_response",
-          requestId,
-          action: "submit",
-          response: { kind: "form", answers },
-        },
-      ]),
-    },
+    { method: "POST", body: { id: `bell_${randomUUID()}`, parts: [{ type: "input_response", ...part }] } },
     options,
   );
+}
+
+export function answerForm(runId: string, requestId: string, answers: Record<string, FormAnswer>, options: CrossmintClientOptions = {}): Promise<void> {
+  return respond(runId, { requestId, action: "submit", response: { kind: "form", answers } }, options);
 }
 
 /** Pay with the operator's order intent. The id is read from configuration and never returned. */
-export async function payWithOrderIntent(
-  runId: string,
-  requestId: string,
-  options: CrossmintClientOptions = {},
-): Promise<void> {
+export async function payWithOrderIntent(runId: string, requestId: string, options: CrossmintClientOptions = {}): Promise<void> {
   const config = options.config ?? crossmintConfig();
-  if (!config.orderIntentId) {
-    throw new CrossmintSetupError("missing_configuration", "CROSSMINT_ORDER_INTENT_ID");
-  }
-  await request(
-    `/agent-checkouts/${encodeURIComponent(runId)}/messages`,
-    {
-      method: "POST",
-      body: message([
-        {
-          type: "input_response",
-          requestId,
-          action: "submit",
-          response: { kind: "payment", orderIntentId: config.orderIntentId },
-        },
-      ]),
-    },
-    { ...options, config },
-  );
+  if (!config.orderIntentId) throw new CrossmintSetupError("missing_configuration", "CROSSMINT_ORDER_INTENT_ID");
+  await respond(runId, { requestId, action: "submit", response: { kind: "payment", orderIntentId: config.orderIntentId } }, { ...options, config });
 }
 
-export async function declineRequest(
-  runId: string,
-  requestId: string,
-  options: CrossmintClientOptions = {},
-): Promise<void> {
-  await request(
-    `/agent-checkouts/${encodeURIComponent(runId)}/messages`,
-    { method: "POST", body: message([{ type: "input_response", requestId, action: "decline" }]) },
-    options,
-  );
+export function declineRequest(runId: string, requestId: string, options: CrossmintClientOptions = {}): Promise<void> {
+  return respond(runId, { requestId, action: "decline" }, options);
 }
 
-export async function cancelCheckout(
-  runId: string,
-  options: CrossmintClientOptions = {},
-): Promise<void> {
+export async function cancelCheckout(runId: string, options: CrossmintClientOptions = {}): Promise<void> {
   await request(`/agent-checkouts/${encodeURIComponent(runId)}/cancel`, { method: "POST" }, options);
 }
 
@@ -599,20 +446,14 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 }
 
 /** Poll until the checkout needs input or ends, or until the timeout. Always returns a snapshot. */
-export async function waitForCheckout(
-  runId: string,
-  options: WaitOptions = {},
-): Promise<CheckoutSnapshot> {
-  const timeoutMs = options.timeoutMs ?? 90_000;
+export async function waitForCheckout(runId: string, options: WaitOptions = {}): Promise<CheckoutSnapshot> {
   const intervalMs = options.intervalMs ?? 2_000;
-  const deadline = Date.now() + timeoutMs;
+  const deadline = Date.now() + (options.timeoutMs ?? 90_000);
   let snapshot = await getCheckout(runId, options);
   for (;;) {
     const settled =
       TERMINAL_STATUSES.has(snapshot.status) ||
-      (snapshot.status === "awaiting_input" &&
-        snapshot.requiredAction !== null &&
-        snapshot.requiredAction.requestId !== options.skipRequestId);
+      (snapshot.status === "awaiting_input" && snapshot.requiredAction !== null && snapshot.requiredAction.requestId !== options.skipRequestId);
     if (settled || Date.now() >= deadline) return snapshot;
     options.signal?.throwIfAborted();
     await sleep(Math.min(intervalMs, Math.max(0, deadline - Date.now())), options.signal);

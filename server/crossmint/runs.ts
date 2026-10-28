@@ -5,8 +5,8 @@ import type { MaxCost } from "./client";
  * pay for, or cancel a checkout it started, so a model-supplied id cannot reach another buyer's
  * run. The cap each run was created with is kept here and checked again at payment time.
  *
- * The registry lives in process memory, like the Link sandbox request set. After a restart or a
- * worker change an unfinished checkout is reconciled in the Crossmint console, not retried here.
+ * The registry lives in process memory. After a restart or a worker change an unfinished checkout
+ * is reconciled in the Crossmint console, not retried here.
  */
 export interface CheckoutRecord {
   runId: string;
